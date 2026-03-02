@@ -1,98 +1,201 @@
-# Check Pytorch installation
+"""yjh/infer.py
+
+该脚本是 yjh 目录下的主推理入口，用于对一个步态视频（或其抽帧图片序列）完成：
+
+1) 人体检测 + 2D 姿态估计（MMPose + MMDet，body8 关键点）
+2) 基于检测框的分割（Segment Anything, SAM）得到人体 mask
+3) mask 后处理 + 几何特征提取（大腿/小腿长度与宽度、足尖 toe 估计）
+4) 根据关节坐标序列计算关节角度曲线、步态事件（HS/TO）与相位比例
+5) 生成角度变化图帧序列，并与预测可视化帧拼接生成结果视频
+
+本文件原始版本把所有逻辑都写在顶层，且存在大量重复 import / 硬编码路径。
+为提高可读性，这里做了“以可读性为主、尽量不改输出”的整理：
+
+- 把顶层执行逻辑收敛到 `main()`，避免 import 时自动跑推理
+- 用 `InferConfig` 管理关键路径/权重配置（目前仍保留默认值，便于对照原实现）
+- 将主要步骤拆为若干小函数，并补充中文注释与必要的类型提示
+
+说明：你当前环境不要求跑通，所以这里的目标是**逻辑更清晰、结构更可维护**。
+"""
+
+from __future__ import annotations
+
+# ========================
+# 0. 环境与依赖导入
+# ========================
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-sys.path.append('/home/yjh/code_yjh/segment-anything-main')
-sys.path.append('/home/yjh/code_yjh/mmpose-main')
-import torch, torchvision
-from tqdm import tqdm
-print('torch version:', torch.__version__, torch.cuda.is_available())
-print('torchvision version:', torchvision.__version__)
-
-# Check MMPose installation
-import mmpose
-import math
-print('mmpose version:', mmpose.__version__)
-import cv2
-# Check mmcv installation
-from mmcv.ops import get_compiling_cuda_version, get_compiler_version
-
-print('cuda version:', get_compiling_cuda_version())
-print('compiler information:', get_compiler_version())
-import matplotlib.pyplot as plt
-import mmcv
-from mmcv import imread
-import mmengine
-from mmengine.registry import init_default_scope
-import numpy as np
-
-from mmpose.apis import inference_topdown
-from mmpose.apis import init_model as init_pose_estimator
-from mmpose.evaluation.functional import nms
-from mmpose.registry import VISUALIZERS
-from mmpose.structures import merge_data_samples
-
-from mmpose.apis import MMPoseInferencer
-from mmpose.utils import adapt_mmdet_pipeline
-#API调用
-from mmcv.image import imread
-
-from mmpose.apis import inference_topdown, init_model
-from mmpose.registry import VISUALIZERS
-from mmpose.structures import merge_data_samples
-
-from mmdet.apis import inference_detector, init_detector
-from segment_anything import sam_model_registry, SamPredictor
-from skimage import morphology
-from zs import zhang_suen_thinning
-from yjh.find_endpoints import find_endpoints_in_skeleton
-from yjh.length_and_width import length_and_width
-from pic2vid import getpic,getvid,sort_by_number
-from demo.topdown_demo_with_mmdet_new import mmpose
-from yjh.footpoint import process_footpoint
-from yjh.footpoint_new import  process_frame_footpoint
-from yjh.angle import find_angle
-from yjh.visual import *
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter 
-from scipy.interpolate import CubicSpline 
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
-def ankle_Dorsiflexion(left_HS,right_HS,coords,path_list):
-    left_angles=[]
-    right_angles=[]
+# 可选：限制可见 GPU。若不需要，请注释该行。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+# 让脚本在“从仓库根目录/任意位置运行”时，也能 import 到 mmpose-main 内部模块。
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# 原作者环境里写死了 /home/yjh/...；这里改成“可选追加”。
+# 用法示例（Linux/Mac）：
+#   export SEGMENT_ANYTHING_DIR=/path/to/segment-anything-main
+#   export MMPOSE_DIR=/path/to/mmpose-main
+for _env in ("SEGMENT_ANYTHING_DIR", "MMPOSE_DIR"):
+    _p = os.environ.get(_env)
+    if _p and _p not in sys.path:
+        sys.path.append(_p)
+
+import math
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torchvision
+from mmcv.ops import get_compiling_cuda_version, get_compiler_version
+from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
+
+print("torch version:", torch.__version__, torch.cuda.is_available())
+print("torchvision version:", torchvision.__version__)
+
+import mmpose
+
+print("mmpose version:", mmpose.__version__)
+print("cuda version:", get_compiling_cuda_version())
+print("compiler information:", get_compiler_version())
+
+# --- 第三方推理 API ---
+from segment_anything import SamPredictor, sam_model_registry
+
+# --- 本项目（yjh）后处理模块 ---
+from demo.topdown_demo_with_mmdet_new import mmpose as MMPoseDetPoseWrapper
+from pic2vid import getvid, sort_by_number
+from yjh.angle import find_angle
+from yjh.footpoint_new import process_frame_footpoint
+from yjh.length_and_width import length_and_width
+
+
+# ========================
+# 1. 配置定义
+# ========================
+
+
+@dataclass(frozen=True)
+class InferConfig:
+    """推理配置。
+
+    说明：为了最大程度保持与原脚本一致，这里仍保留原作者的默认路径。
+    你可以在本机改成相对路径或 Windows 路径。
+    """
+
+    # 数据集/输出根目录（原作者硬编码在 /home/yjh/...）
+    work_dir: Path = Path("/home/yjh/code_yjh/mmpose-main/yjh")
+    videoname: str = "walk_woman_processed_1"
+
+    # SAM 权重
+    sam_checkpoint: Path = Path("/home/yjh/code_yjh/sam_vit_h_4b8939.pth")
+    sam_model_type: str = "vit_h"
+    device: str = "cuda"
+
+    # det + pose 配置（来自 demo/topdown_demo_with_mmdet_new.py 的封装）
+    det_config: str = "/home/yjh/code_yjh/mmpose-main/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person.py"
+    det_checkpoint: str = "https://download.openmmlab.com/mmpose/v1/projects/rtmpose/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
+    pose_config: str = "/home/yjh/code_yjh/mmpose-main/configs/body_2d_keypoint/rtmpose/body8/rtmpose-m_8xb256-420e_body8-256x192.py"
+    pose_checkpoint: str = "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.pth"
+
+
+def build_paths(cfg: InferConfig) -> Dict[str, Path]:
+    """根据 videoname 构建输入/输出路径。"""
+
+    base = cfg.work_dir / "ori" / cfg.videoname
+    return {
+        "base": base,
+        "pic": base / "pic",
+        "mask": base / "mask",
+        "skeleton": base / "skeleton",
+        "pred": base / "pred",
+        "pred1": base / "pred1",
+        "chart": base / "chart",
+        "result_dir": cfg.work_dir / "result",
+    }
+
+
+def ensure_dirs(paths: Dict[str, Path]) -> None:
+    """创建必要目录（若已存在则忽略）。"""
+
+    for k in ("pic", "mask", "skeleton", "pred", "pred1", "chart", "result_dir"):
+        paths[k].mkdir(parents=True, exist_ok=True)
+
+
+def ankle_Dorsiflexion(
+    left_HS: Sequence[int],
+    right_HS: Sequence[int],
+    coords: np.ndarray,
+) -> Tuple[List[float], List[float]]:
+    """踝背屈角（示例实现，按原脚本逻辑保留）。
+
+    说明：该函数不是标准的“踝关节角度定义”，而是按原作者的构造方法：
+    - 以 toe 点和一个“水平参考点”构造三点角，计算足部相对水平的某种背屈角。
+    - left/right 分别在 HS（Heel Strike）事件帧上计算。
+    """
+
+    left_angles: List[float] = []
+    right_angles: List[float] = []
+
+    # coords: [T, 8, 2]
+    # 2: left ankle, 6: left toe
     for i in left_HS:
-        # image=cv2.imread(predpath1+path_list[i])
-        point_a=(coords[i,2,0],max(coords[:,6,1]))
-        point_b=coords[i,6,:]
-        point_c=(point_a[0]+2,point_a[1])
-        left_angle=find_angle(point_c,point_b,point_a)
-        left_angles.append(left_angle)
-        # cv2.circle(image, (int(point_a[0]), int(point_a[1])), 4, (0, 0, 255), -1)
-        # cv2.imwrite('/home/yjh/code_yjh/mmpose-main/yjh/test.jpg',image)
-        # print('haha')
+        point_a = (coords[i, 2, 0], float(np.max(coords[:, 6, 1])))
+        point_b = coords[i, 6, :]
+        point_c = (point_a[0] + 2, point_a[1])
+        left_angles.append(float(find_angle(point_c, point_b, point_a)))
+
+    # 5: right ankle, 7: right toe
     for t in right_HS:
-        point_a=(coords[t,5,0],max(coords[:,7,1]))
-        point_b=coords[t,7,:]
-        point_c=(point_a[0]+2,point_a[1])
-        right_angle=find_angle(point_c,point_b,point_a)
-        right_angles.append(right_angle)
-        
-    return left_angle,right_angle
+        point_a = (coords[t, 5, 0], float(np.max(coords[:, 7, 1])))
+        point_b = coords[t, 7, :]
+        point_c = (point_a[0] + 2, point_a[1])
+        right_angles.append(float(find_angle(point_c, point_b, point_a)))
+
+    return left_angles, right_angles
         
         
 
-def getresult(hip_point, knee_point, ankle_point, toe_point,Thigh_length,Thigh_width,calf_length,calf_width):
-    perp_point=(hip_point[0],hip_point[1]+2)
+def getresult(
+    hip_point: np.ndarray,
+    knee_point: np.ndarray,
+    ankle_point: np.ndarray,
+    toe_point: Tuple[int, int],
+    thigh_length: float,
+    thigh_width: float,
+    calf_length: float,
+    calf_width: float,
+) -> List[float]:
+    """计算单侧下肢的关键输出（角度 + y坐标 + 长宽）。"""
+
+    perp_point = (hip_point[0], hip_point[1] + 2)
     ankle_angle = find_angle(toe_point, knee_point, ankle_point)
     knee_angle = find_angle(hip_point, ankle_point, knee_point)
     hip_angle = find_angle(knee_point, perp_point, hip_point)
-    hip_y=hip_point[1]
-    knee_y=knee_point[1]
-    ankle_y=ankle_point[1]
-    return [ankle_angle,knee_angle,hip_angle,hip_y,knee_y,ankle_y,Thigh_length,Thigh_width,calf_length,calf_width]
+
+    hip_y = hip_point[1]
+    knee_y = knee_point[1]
+    ankle_y = ankle_point[1]
+
+    return [
+        float(ankle_angle),
+        float(knee_angle),
+        float(hip_angle),
+        float(hip_y),
+        float(knee_y),
+        float(ankle_y),
+        float(thigh_length),
+        float(thigh_width),
+        float(calf_length),
+        float(calf_width),
+    ]
 
 def getcycletime(time_cycle):
     if len(time_cycle) <2:
@@ -116,55 +219,54 @@ def stance_and_swing(TO,HS,time_cycle):
     #     if i > TO[-2] and i < TO[-1] :
     #         return i-TO[-2] , TO[-1] -i,i
         
-start_time=time.time()
-videoname='walk_woman_processed_1'
-picpath='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/pic'
-maskpath='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/mask/'
-skeletonpath='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/skeleton/'
-predpath='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/pred/'
-chartpath='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/chart/'
-predpath1='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/pred1/'
-# getpic('/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'.mp4','/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/pic/')
-if not os.path.exists(maskpath):
-    os.makedirs(maskpath)
-if not os.path.exists(skeletonpath):
-    os.makedirs(skeletonpath)
-if not os.path.exists(picpath):
-    os.makedirs(picpath)
-if not os.path.exists(predpath):
-    os.makedirs(predpath)
-if not os.path.exists(chartpath):
-    os.makedirs(chartpath)
-if not os.path.exists(predpath1):
-    os.makedirs(predpath1)
+def init_sam_predictor(cfg: InferConfig) -> SamPredictor:
+    """初始化 SAM predictor。"""
 
-for i in os.listdir(picpath):
-    img_path=os.path.join(picpath,i)
-results=np.zeros((len(os.listdir(picpath)),2,10))
-coords= np.zeros((len(os.listdir(picpath)),8,2))
-# bboxes=np.zeros((len(os.listdir(picpath)),4,2))
+    sam = sam_model_registry[cfg.sam_model_type](checkpoint=str(cfg.sam_checkpoint))
+    sam.to(device=cfg.device)
+    return SamPredictor(sam)
 
-sam_checkpoint = '/home/yjh/code_yjh/sam_vit_h_4b8939.pth' # 预训练模型地址
-model_type = "vit_h"
 
-device = "cuda" # 使用GPU
+def init_det_pose_wrapper(cfg: InferConfig) -> object:
+    """初始化 det+pose wrapper（来自 demo/topdown_demo_with_mmdet_new.py）。"""
 
-sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-sam.to(device=device)
+    return MMPoseDetPoseWrapper(
+        args_input={
+            "det_config": cfg.det_config,
+            "det_checkpoint": cfg.det_checkpoint,
+            "pose_config": cfg.pose_config,
+            "pose_checkpoint": cfg.pose_checkpoint,
+            "draw_heatmap": False,
+            "skeleton_style": "mmpose",
+        }
+    )
 
-# 调用预测模型
-predictor = SamPredictor(sam)
-detect=mmpose(args_input={'det_config': '/home/yjh/code_yjh/mmpose-main/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person.py','det_checkpoint':'https://download.openmmlab.com/mmpose/v1/projects/rtmpose/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth'
-                            ,'pose_config':'/home/yjh/code_yjh/mmpose-main/configs/body_2d_keypoint/rtmpose/body8/rtmpose-m_8xb256-420e_body8-256x192.py','pose_checkpoint':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.pth'
-                            ,'draw_heatmap':False,'skeleton_style':'mmpose'})
-# angle_data = AngleData()
-# chart = AngleChart()
-cnt=0
 
-path_list=sorted(os.listdir(picpath), key=sort_by_number)
-# 存储上一帧以及最后一次非重叠帧的状态信息
-# We store state information from the previous frame and the last non-overlapping frame.
-previous_frame_data = {
+def run_inference_on_frames(
+    cfg: InferConfig,
+    paths: Dict[str, Path],
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """对帧序列做逐帧推理与特征提取。
+
+    返回：
+        coords: [T, 8, 2]
+        results: [T, 2, 10]
+        frame_files: 排好序的帧文件名列表（仅文件名，不含目录）
+    """
+
+    pic_dir = paths["pic"]
+    frame_files = sorted(os.listdir(pic_dir), key=sort_by_number)
+    if not frame_files:
+        raise RuntimeError(f"pic 目录为空：{pic_dir}")
+
+    coords = np.zeros((len(frame_files), 8, 2), dtype=float)
+    results = np.zeros((len(frame_files), 2, 10), dtype=float)
+
+    predictor = init_sam_predictor(cfg)
+    detect = init_det_pose_wrapper(cfg)
+
+    # 存储上一帧以及最后一次非重叠帧的状态信息（用于 toe 点在重叠时保持连续）。
+    previous_frame_data: Dict[str, object] = {
     'toe_left': None,
     'knee_left': None,
     'ank_left': None,
@@ -186,66 +288,132 @@ previous_frame_data = {
     # The last validly calculated distance from toe to knee
     'toe_knee_radius_left': 0,
     'toe_knee_radius_right': 0
-}
+    }
 
-for i in path_list:
-    cnt+=1
-    print(cnt)
-    idx=int(i.split('.')[0])
-    img_path=os.path.join(picpath,i)
-    image = cv2.imread(img_path)
-    # 还原原图像色彩
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)     
-    device = 'cuda'
-    "此处-应该改为_"
-    pred_instances,bbox=detect.run(img_path,predpath+i)
-    #髋关节11,12，膝关节13,14，踝关节15,16
-    #表示各个关节的坐标
-    hip_left,hip_right= pred_instances.keypoints[0][11],pred_instances.keypoints[0][12]
-    knee_left,knee_right=pred_instances.keypoints[0][13],pred_instances.keypoints[0][14]
-    ank_left,ank_right=pred_instances.keypoints[0][15],pred_instances.keypoints[0][16]
-    
-    # bboxes[idx-1]=bbox
-    predictor.set_image(image)
-    masks, score, _ = predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=bbox[None, :],
-        multimask_output=False,
-    )
-    masks=masks[0]
-    masks_uint8 = masks.astype(np.uint8) * 255 
+    for frame_idx, filename in enumerate(frame_files, start=1):
+        # 文件名通常形如 00001.jpg，这里沿用原作者的 idx-1 写入策略。
+        idx = int(Path(filename).stem)
+        arr_index = idx - 1
 
-    #闭运算
-    morph_kernel_size=5
-    kernel = np.ones((morph_kernel_size, morph_kernel_size), np.uint8)
-    processed_mask = cv2.morphologyEx(masks_uint8, cv2.MORPH_CLOSE, kernel)
-    cv2.imwrite(maskpath+i,processed_mask)
-    Thigh_length_left,Thigh_width_left=length_and_width(image,processed_mask,hip_left,knee_left)
-    Thigh_length_right,Thigh_width_right=length_and_width(image,processed_mask,hip_right,knee_right)
-    calf_length_left,calf_width_left=length_and_width(image,processed_mask,knee_left,ank_left)
-    calf_length_right,calf_width_right=length_and_width(image,processed_mask,knee_right,ank_right)
-    toe_left, toe_right,previous_frame_data=process_frame_footpoint(processed_mask, ank_left, knee_left, calf_length_left, ank_right, knee_right, calf_length_right,previous_frame_data)
-    
-    # toe_left=findfootpoint(processed_mask,ank_left,knee_left,1.2*calf_length_left)
-    # toe_right=findfootpoint(processed_mask,ank_right,knee_right,1.2*calf_length_right)
-    
-    image=cv2.imread(predpath+i)
-    cv2.circle(image, (int(toe_left[0]), int(toe_left[1])), 4, (0, 0, 255), -1)
-    cv2.circle(image, (int(toe_right[0]), int(toe_right[1])), 4, (0, 0, 255), -1)
-    cv2.line(image, (int(toe_left[0]), int(toe_left[1])), (int(ank_left[0]), int(ank_left[1])), (85, 255, 0), 2)
-    cv2.line(image, (int(toe_right[0]), int(toe_right[1])), (int(ank_right[0]), int(ank_right[1])), (0, 120, 255), 2)
-    cv2.imwrite(predpath1+i,image)
-    
-    coords[idx-1]=[hip_left,knee_left,ank_left,hip_right,knee_right,ank_right,toe_left,toe_right]
-    
-    result_left=getresult(hip_left, knee_left, ank_left, toe_left, Thigh_length_left, Thigh_width_left, calf_length_left, calf_width_left)
-    result_right=getresult(hip_right, knee_right, ank_right, toe_right, Thigh_length_right, Thigh_width_right, calf_length_right, calf_width_right)
-    
-    results[idx-1]=np.array([result_left,result_right])
-  
-np.save('/home/yjh/code_yjh/mmpose-main/yjh/result/'+videoname+'_coords.npy',coords)
-np.save('/home/yjh/code_yjh/mmpose-main/yjh/result/'+videoname+'_results.npy',results)
+        img_path = pic_dir / filename
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            print(f"[WARN] 无法读取图像：{img_path}")
+            continue
+
+        # SAM predictor 期望 RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        # det + pose，输出可视化写到 pred 目录
+        pred_out_path = paths["pred"] / filename
+        pred_instances, bbox = detect.run(str(img_path), str(pred_out_path))
+
+        # 关键点索引（COCO）：髋 11/12，膝 13/14，踝 15/16
+        hip_left, hip_right = pred_instances.keypoints[0][11], pred_instances.keypoints[0][12]
+        knee_left, knee_right = pred_instances.keypoints[0][13], pred_instances.keypoints[0][14]
+        ank_left, ank_right = pred_instances.keypoints[0][15], pred_instances.keypoints[0][16]
+
+        # --- SAM 分割 ---
+        predictor.set_image(img_rgb)
+        masks, score, _ = predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=bbox[None, :],
+            multimask_output=False,
+        )
+        mask = masks[0]
+        mask_uint8 = mask.astype(np.uint8) * 255
+
+        # 闭运算：填洞/连接断裂
+        morph_kernel_size = 5
+        kernel = np.ones((morph_kernel_size, morph_kernel_size), np.uint8)
+        processed_mask = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+        cv2.imwrite(str(paths["mask"] / filename), processed_mask)
+
+        # --- 长宽估计 ---
+        thigh_length_left, thigh_width_left = length_and_width(img_rgb, processed_mask, hip_left, knee_left)
+        thigh_length_right, thigh_width_right = length_and_width(img_rgb, processed_mask, hip_right, knee_right)
+        calf_length_left, calf_width_left = length_and_width(img_rgb, processed_mask, knee_left, ank_left)
+        calf_length_right, calf_width_right = length_and_width(img_rgb, processed_mask, knee_right, ank_right)
+
+        # --- toe 点估计（含重叠预测）---
+        toe_left, toe_right, previous_frame_data = process_frame_footpoint(
+            processed_mask,
+            ank_left,
+            knee_left,
+            calf_length_left,
+            ank_right,
+            knee_right,
+            calf_length_right,
+            previous_frame_data,
+        )
+
+        # --- 可视化：在 pred 图上画 toe 点与 toe-ankle 连线 ---
+        pred_img = cv2.imread(str(pred_out_path))
+        if pred_img is not None:
+            cv2.circle(pred_img, (int(toe_left[0]), int(toe_left[1])), 4, (0, 0, 255), -1)
+            cv2.circle(pred_img, (int(toe_right[0]), int(toe_right[1])), 4, (0, 0, 255), -1)
+            cv2.line(
+                pred_img,
+                (int(toe_left[0]), int(toe_left[1])),
+                (int(ank_left[0]), int(ank_left[1])),
+                (85, 255, 0),
+                2,
+            )
+            cv2.line(
+                pred_img,
+                (int(toe_right[0]), int(toe_right[1])),
+                (int(ank_right[0]), int(ank_right[1])),
+                (0, 120, 255),
+                2,
+            )
+            cv2.imwrite(str(paths["pred1"] / filename), pred_img)
+
+        # --- 结果落盘：coords/results ---
+        coords[arr_index] = [
+            hip_left,
+            knee_left,
+            ank_left,
+            hip_right,
+            knee_right,
+            ank_right,
+            toe_left,
+            toe_right,
+        ]
+
+        result_left = getresult(
+            hip_left,
+            knee_left,
+            ank_left,
+            toe_left,
+            thigh_length_left,
+            thigh_width_left,
+            calf_length_left,
+            calf_width_left,
+        )
+        result_right = getresult(
+            hip_right,
+            knee_right,
+            ank_right,
+            toe_right,
+            thigh_length_right,
+            thigh_width_right,
+            calf_length_right,
+            calf_width_right,
+        )
+        results[arr_index] = np.array([result_left, result_right], dtype=float)
+
+        if frame_idx % 50 == 0:
+            print(f"Processed {frame_idx}/{len(frame_files)} frames")
+
+    return coords, results, frame_files
+
+
+def save_npy_results(cfg: InferConfig, paths: Dict[str, Path], coords: np.ndarray, results: np.ndarray) -> None:
+    """保存 npy 文件到 result 目录。"""
+
+    np.save(str(paths["result_dir"] / f"{cfg.videoname}_coords.npy"), coords)
+    np.save(str(paths["result_dir"] / f"{cfg.videoname}_results.npy"), results)
 # np.save('/home/yjh/code_yjh/mmpose-main/yjh/result/walk_woman_processed_2_bboxes.npy',bboxes)
 # x_hip_left,y_hip_left=hip_left[0],hip_left[1]
     # x_hip_right,y_hip_right=hip_right[0],hip_right[1]
@@ -275,14 +443,17 @@ np.save('/home/yjh/code_yjh/mmpose-main/yjh/result/'+videoname+'_results.npy',re
 
 # coords=np.load('/home/yjh/code_yjh/mmpose-main/yjh/result/'+videoname+'_coords.npy')
 
-print('Thigh_length_left:',max(results[:,0,6]))
-print('Thigh_width_left:',np.mean(results[:,0,7]))
-print('Thigh_length_right:',max(results[:,1,6]))
-print('Thigh_width_right:',np.mean(results[:,1,7]))
-print('calf_length_left:',max(results[:,0,8]))
-print('calf_width_left:',np.mean(results[:,0,9]))
-print('calf_length_right:',max(results[:,1,8]))
-print('calf_width_right:',np.mean(results[:,1,9]))
+def print_length_width_summary(results: np.ndarray) -> None:
+    """打印长度/宽度统计（按原脚本输出保留）。"""
+
+    print('Thigh_length_left:', max(results[:, 0, 6]))
+    print('Thigh_width_left:', np.mean(results[:, 0, 7]))
+    print('Thigh_length_right:', max(results[:, 1, 6]))
+    print('Thigh_width_right:', np.mean(results[:, 1, 7]))
+    print('calf_length_left:', max(results[:, 0, 8]))
+    print('calf_width_left:', np.mean(results[:, 0, 9]))
+    print('calf_length_right:', max(results[:, 1, 8]))
+    print('calf_width_right:', np.mean(results[:, 1, 9]))
 
 
     # angle_data.add_data(result_left[2])
@@ -297,115 +468,98 @@ print('calf_width_right:',np.mean(results[:,1,9]))
 
 
 
-# 判断HS和TO以及步态周期
-t=np.arange(0,coords.shape[0],1)
-left_TO=[]
-left_HS=[]
-right_TO=[]
-right_HS=[]
-time_cycle1=[]
-time_cycle2=[]
-left_angles=[]
-right_angles=[]
-v_body=(coords[:,0,0]+coords[:,3,0])/2
-# body_smooth = savgol_filter(v_body_mean, 40, 4)
-# body_cs = CubicSpline(t,body_smooth)  
-# body_velocity_spline = body_cs.derivative()  # 速度函数
-# v_body = body_velocity_spline(t)
-data_raw_x=np.zeros((6,coords.shape[0]))
-data_smooth_x=np.zeros((6,coords.shape[0]))
-v_x=np.zeros((6,coords.shape[0]))
-v_y=np.zeros((6,coords.shape[0]))
-# 求出x轴速度
-for j in range(6):
-    img_path=os.path.join(picpath,path_list[j])
-    image = cv2.imread(img_path)
-    # 还原原图像色彩
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  
-    data = coords[:,j,0]-v_body
-    data_smooth = savgol_filter(data, 40, 4)
-    # data = coords[:,j,0]
-    # data_smooth = savgol_filter(coords[:,j,0], 40, 4)
-    cs = CubicSpline(t,data_smooth)  
-    velocity_spline = cs.derivative()  # 速度函数
-    v = velocity_spline(t)  # 计算时间点上的速度
+def estimate_gait_events_and_cycle(coords: np.ndarray) -> None:
+    """根据 coords 估计 HS/TO 与步态周期，并打印相位比例。
 
-    data_raw_x[j]=data
-    data_smooth_x[j]=data_smooth 
-    v_x[j]=v  
-    
-# # 左脚
-# for m in range(0,v_x.shape[1]-2):
-#     if v_x[2,m]-v_x[1,m]<=0 and v_x[2,m+1]-v_x[1,m+1]>0:
-#         left_TO.append(m)
-#     elif v_x[2,m]-v_x[1,m]>=0 and v_x[2,m+1]-v_x[1,m+1]<0:
-#         left_HS.append(m)
-# # 右脚
-# for m in range(0,v_x.shape[1]-2):
-#     if v_x[5,m]-v_x[4,m]<=0 and v_x[5,m+1]-v_x[4,m+1]>0:
-#         right_TO.append(m)
-#     elif v_x[5,m]-v_x[4,m]>=0 and v_x[5,m+1]-v_x[4,m+1]<0:
-#         right_HS.append(m) 
-for m in range(1,v_x.shape[1]):
-    # 左脚
-    key_left=data_smooth_x[2,:]-data_smooth_x[1,:]
-    if key_left[m]==min(key_left[max(0,m-5):min(m+5,key_left.shape[0])]):
-        if   m < v_x.shape[1]-1:
-            left_TO.append(m)
-    elif key_left[m]==max(key_left[max(0,m-5):min(m+5,key_left.shape[0])]):
-        if  m < v_x.shape[1]-1:
-            left_HS.append(m)
-    # 右脚
-    key_right=data_smooth_x[5,:]-data_smooth_x[4,:]
-    if key_right[m]==min(key_right[max(0,m-5):min(m+5,key_right.shape[0])]):
-        if  m < v_x.shape[1]-1:
-            right_TO.append(m)
-    elif key_right[m]==max(key_right[max(0,m-5):min(m+5,key_right.shape[0])]):
-        if  m < v_x.shape[1]-1:
-            right_HS.append(m) 
-    # 步行周期(取往前迈步作为判断标准)
-    key1=data_smooth_x[1,:]-data_smooth_x[0,:]
-    key2=data_smooth_x[4,:]-data_smooth_x[3,:]
-     # 左脚
-    if max(key1[max(0,m-5):m]) < 0 and min(key1[m:min(m+5,key1.shape[0])]) > 0:
-        if  m < v_x.shape[1]-1:
-            time_cycle1.append(m)
-    # if max(key1[max(0,m-5):m]) < 0 and min(key1[m:min(m+5,key1.shape[0])]) > 0:
-    #     if  m < v_x.shape[1]-1:
-    #         time_cycle2.append(m)
-    # 右脚
-    if max(key2[max(0,m-5):m]) < 0 and min(key2[m:min(m+5,key1.shape[0])]) > 0:
-        if  m < v_x.shape[1]-1:
-            time_cycle2.append(m)
-    # if max(key2[max(0,m-5):m]) < 0 and min(key2[m:min(m+5,key1.shape[0])]) > 0:
-    #     if  m < v_x.shape[1]-1:
-    #         time_cycle2.append(m)        
-left_angles,right_angles=ankle_Dorsiflexion(left_HS,right_HS,coords,path_list)
-print(left_angles,right_angles)
+    该部分算法沿用原脚本：
+    - 对关键点 x 方向相对躯干位移做 Savitzky-Golay 平滑
+    - 用 CubicSpline 求导得到速度（原脚本后续并未直接用速度阈值）
+    - 用局部极值寻找 TO/HS
+    - 再用“膝-髋相对位置符号翻转”作为周期点
+    """
 
-# if getcycletime(time_cycle1)*getcycletime(time_cycle2) !=0:
-#     time_cycle=(getcycletime(time_cycle1)+getcycletime(time_cycle2))/2
-# elif getcycletime(time_cycle1)*getcycletime(time_cycle2) ==0
-if len(time_cycle1) >1 and len(time_cycle2) >1:
-    time_cycle=(getcycletime(time_cycle1)+getcycletime(time_cycle2))/2
-elif len(time_cycle1) >1 and len(time_cycle2) <=1:
-    time_cycle=getcycletime(time_cycle1)
-elif len(time_cycle1) <=1 and len(time_cycle2) >1:
-    time_cycle=getcycletime(time_cycle2)
-else:
-    print("未录制到完整周期，请重新录制")
-TO_left_instance,HS_left_instance=stance_and_swing(left_TO,left_HS,time_cycle1)
-TO_right_instance,HS_right_instance=stance_and_swing(right_TO,right_HS,time_cycle2)
-swing_left=(HS_left_instance-TO_left_instance)/time_cycle*100
-# print('left_TO:',left_TO)
-# print('left_HS:',left_HS)
-# print('right_TO:',right_TO)
-# print('right_HS:',right_HS) 
-print('完整周期用时:{}帧' .format(time_cycle))
-print('左脚摇摆相占比:{:.3f}%'.format(swing_left))
-print('左脚支撑相占比:{:.3f}%'.format(100-swing_left))
-print('双支撑相占比:{:.3f}%'.format(min(abs(TO_left_instance-HS_right_instance),abs(TO_right_instance-HS_left_instance))/time_cycle*100))
-print('总摇摆相占比:%')
+    t = np.arange(0, coords.shape[0], 1)
+    left_TO: List[int] = []
+    left_HS: List[int] = []
+    right_TO: List[int] = []
+    right_HS: List[int] = []
+    time_cycle1: List[int] = []
+    time_cycle2: List[int] = []
+
+    # 用髋点均值近似躯干 x（用于消除整体位移）
+    v_body = (coords[:, 0, 0] + coords[:, 3, 0]) / 2
+
+    data_smooth_x = np.zeros((6, coords.shape[0]))
+    v_x = np.zeros((6, coords.shape[0]))
+
+    # 求出 x 轴速度（仅针对 6 个关节：左右 hip/knee/ank）
+    for j in range(6):
+        data = coords[:, j, 0] - v_body
+        data_smooth = savgol_filter(data, 40, 4)
+        cs = CubicSpline(t, data_smooth)
+        v = cs.derivative()(t)
+
+        data_smooth_x[j] = data_smooth
+        v_x[j] = v
+
+    # 局部极值检测：ankle_x - knee_x 作为脚前后摆动的 proxy
+    key_left = data_smooth_x[2, :] - data_smooth_x[1, :]
+    key_right = data_smooth_x[5, :] - data_smooth_x[4, :]
+    # 步行周期：knee_x - hip_x 由负变正（往前迈步）
+    key_cycle_left = data_smooth_x[1, :] - data_smooth_x[0, :]
+    key_cycle_right = data_smooth_x[4, :] - data_smooth_x[3, :]
+
+    for m in range(1, v_x.shape[1]):
+        # 左脚 TO/HS
+        if key_left[m] == np.min(key_left[max(0, m - 5) : min(m + 5, key_left.shape[0])]):
+            if m < v_x.shape[1] - 1:
+                left_TO.append(m)
+        elif key_left[m] == np.max(key_left[max(0, m - 5) : min(m + 5, key_left.shape[0])]):
+            if m < v_x.shape[1] - 1:
+                left_HS.append(m)
+
+        # 右脚 TO/HS
+        if key_right[m] == np.min(key_right[max(0, m - 5) : min(m + 5, key_right.shape[0])]):
+            if m < v_x.shape[1] - 1:
+                right_TO.append(m)
+        elif key_right[m] == np.max(key_right[max(0, m - 5) : min(m + 5, key_right.shape[0])]):
+            if m < v_x.shape[1] - 1:
+                right_HS.append(m)
+
+        # 周期点（左膝相对左髋由负变正）
+        if np.max(key_cycle_left[max(0, m - 5) : m]) < 0 and np.min(key_cycle_left[m : min(m + 5, key_cycle_left.shape[0])]) > 0:
+            if m < v_x.shape[1] - 1:
+                time_cycle1.append(m)
+
+        # 周期点（右膝相对右髋由负变正）
+        if np.max(key_cycle_right[max(0, m - 5) : m]) < 0 and np.min(key_cycle_right[m : min(m + 5, key_cycle_right.shape[0])]) > 0:
+            if m < v_x.shape[1] - 1:
+                time_cycle2.append(m)
+
+    # 仅打印：踝背屈角序列
+    left_angles, right_angles = ankle_Dorsiflexion(left_HS, right_HS, coords)
+    print(left_angles, right_angles)
+
+    # 估计周期长度（帧）
+    if len(time_cycle1) > 1 and len(time_cycle2) > 1:
+        time_cycle = (getcycletime(time_cycle1) + getcycletime(time_cycle2)) / 2
+    elif len(time_cycle1) > 1 and len(time_cycle2) <= 1:
+        time_cycle = getcycletime(time_cycle1)
+    elif len(time_cycle1) <= 1 and len(time_cycle2) > 1:
+        time_cycle = getcycletime(time_cycle2)
+    else:
+        print("未录制到完整周期，请重新录制")
+        return
+
+    TO_left_instance, HS_left_instance = stance_and_swing(left_TO, left_HS, time_cycle1)
+    TO_right_instance, HS_right_instance = stance_and_swing(right_TO, right_HS, time_cycle2)
+    swing_left = (HS_left_instance - TO_left_instance) / time_cycle * 100
+
+    print('完整周期用时:{}帧' .format(time_cycle))
+    print('左脚摇摆相占比:{:.3f}%'.format(swing_left))
+    print('左脚支撑相占比:{:.3f}%'.format(100-swing_left))
+    print('双支撑相占比:{:.3f}%'.format(min(abs(TO_left_instance-HS_right_instance),abs(TO_right_instance-HS_left_instance))/time_cycle*100))
+    print('总摇摆相占比:%')
 
 '''#绘结果图
 title_list_angle=['ankle_left','ankle_right','knee_left','knee_right','hip_left','hip_right']
@@ -461,101 +615,115 @@ for idx in range(1,len(results)+1):
     plt.savefig('/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/chart/'+i)
     plt.clf()
     plt.close()'''
-title_list_angle = ['ankle_left', 'ankle_right', 'knee_left', 'knee_right', 'hip_left', 'hip_right']
-title_list_x=['hip_left','knee_left','ank_left','hip_right','knee_right','ank_right']
-output_folder = f'/home/yjh/code_yjh/mmpose-main/yjh/ori/{videoname}/chart/'
+def generate_angle_chart_frames(results: np.ndarray, output_folder: Path) -> None:
+    """生成关节角度曲线图帧序列（与原实现一致：3x2 子图）。"""
 
-os.makedirs(output_folder, exist_ok=True)
+    title_list_angle = ['ankle_left', 'ankle_right', 'knee_left', 'knee_right', 'hip_left', 'hip_right']
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-# 1. 预计算所有平滑数据和Y轴范围
-print("Pre-calculating data...")
-smoothed_data = np.zeros_like(results)
-y_limits = []
-for k in range(6):
-    col = k % 2
-    joint_idx = k // 2
-    
-    # 计算平滑数据
-    # 注意：窗口长度不能大于数据长度，这里假设 len(results) >= 40
-    if len(results) >= 40:
-        smoothed_data[:, col, joint_idx] = savgol_filter(results[:, col, joint_idx], 40, 4)
-    else:
-        # 如果数据点太少，无法使用savgol_filter，则直接使用原始数据
-        smoothed_data[:, col, joint_idx] = results[:, col, joint_idx]
-
-    # 计算Y轴范围
-    min_val = results[:, col, joint_idx].min()
-    max_val = results[:, col, joint_idx].max()
-    y_limits.append((min_val - 15, max_val + 15))
-print("Pre-calculation finished.")
-
-# 2. 创建一个静态的图形和坐标轴
-print("Creating static plot canvas...")
-fig, axes = plt.subplots(3, 2, figsize=(12, 8))
-fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95, wspace=0.2, hspace=0.3)
-axes = axes.flatten() # 将2D数组转换为1D，方便索引
-
-# 用于存储所有曲线对象的列表
-lines = []
-
-for k, ax in enumerate(axes):
-    # 设置所有不动的元素：标题、范围、网格、图例等
-    ax.set_ylim(y_limits[k])
-    ax.set_xlim(0, len(results))
-    ax.grid(True)
-    ax.tick_params(labelsize=6)
-    ax.set_title(title_list_angle[k], fontsize=8, pad=5)
-    
-    # 仅边缘子图显示标签
-    if k not in [0, 2, 4]:
-        ax.set_ylabel('')
-    if k < 4: # 原代码是 k<3，但3x2布局中第4个子图(索引为3)也不应该有x轴标签
-        ax.set_xlabel('')
-
-    # 创建空的曲线对象，并设置好颜色和标签
-    # 我们之后只更新这些对象的数据
-    raw_line, = ax.plot([], [], color='blue', label='Raw Signal')
-    smooth_line, = ax.plot([], [], color='red', label='Smoothed Signal')
-    lines.append((raw_line, smooth_line))
-    
-    ax.legend(loc='upper right', fontsize=6)
-print("Canvas created.")
-
-# 3. 主循环：只更新数据并保存
-print("Starting frame generation...")
-total_frames = len(results)
-x_axis_data = np.arange(total_frames)
-
-for idx in range(1, total_frames + 1):
-    if idx % 50 == 0: # 每处理50帧打印一次进度
-        print(f"Processing frame {idx}/{total_frames}")
-
-    # 为每个子图更新数据
-    for k, (raw_line, smooth_line) in enumerate(lines):
+    # 1) 预计算平滑数据 + y 轴范围（提升生成帧性能）
+    print("Pre-calculating data...")
+    smoothed_data = np.zeros_like(results)
+    y_limits = []
+    for k in range(6):
         col = k % 2
         joint_idx = k // 2
-        
-        # 更新原始数据曲线
-        raw_line.set_data(x_axis_data[:idx], results[:idx, col, joint_idx])
-        
-        # 更新平滑数据曲线
-        smooth_line.set_data(x_axis_data[:idx], smoothed_data[:idx, col, joint_idx])
+        if len(results) >= 40:
+            smoothed_data[:, col, joint_idx] = savgol_filter(results[:, col, joint_idx], 40, 4)
+        else:
+            smoothed_data[:, col, joint_idx] = results[:, col, joint_idx]
 
-    # 保存整个图形
-    filename = str(idx).zfill(5) + ".jpg"
-    plt.savefig(os.path.join(output_folder, filename), dpi=100) # 可以适当调整dpi来平衡清晰度和文件大小
+        min_val = results[:, col, joint_idx].min()
+        max_val = results[:, col, joint_idx].max()
+        y_limits.append((min_val - 15, max_val + 15))
+    print("Pre-calculation finished.")
 
-# 循环结束后关闭图形，释放内存
-plt.close(fig)
-print("All frames generated.")
+    # 2) 创建静态画布
+    print("Creating static plot canvas...")
+    fig, axes = plt.subplots(3, 2, figsize=(12, 8))
+    fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95, wspace=0.2, hspace=0.3)
+    axes = axes.flatten()
 
-#转成视频
-path1='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/pred1/'
-path2='/home/yjh/code_yjh/mmpose-main/yjh/ori/'+videoname+'/chart/'
-videopath='/home/yjh/code_yjh/mmpose-main/yjh/result/'+videoname+'.mp4'
-getvid(path1,path2,videopath)
-end_time=time.time()
-print('运行时间：',end_time-start_time)
+    # 用于存储所有曲线对象的列表（每个子图两条线：raw + smooth）
+    lines = []
+    for k, ax in enumerate(axes):
+        ax.set_ylim(y_limits[k])
+        ax.set_xlim(0, len(results))
+        ax.grid(True)
+        ax.tick_params(labelsize=6)
+        ax.set_title(title_list_angle[k], fontsize=8, pad=5)
+
+        # 仅边缘子图显示标签
+        if k not in [0, 2, 4]:
+            ax.set_ylabel('')
+        if k < 4:
+            ax.set_xlabel('')
+
+        raw_line, = ax.plot([], [], color='blue', label='Raw Signal')
+        smooth_line, = ax.plot([], [], color='red', label='Smoothed Signal')
+        lines.append((raw_line, smooth_line))
+        ax.legend(loc='upper right', fontsize=6)
+
+    print("Canvas created.")
+
+    # 3) 主循环：逐帧更新曲线并保存
+    print("Starting frame generation...")
+    total_frames = len(results)
+    x_axis_data = np.arange(total_frames)
+
+    for idx in range(1, total_frames + 1):
+        if idx % 50 == 0:
+            print(f"Processing frame {idx}/{total_frames}")
+
+        for k, (raw_line, smooth_line) in enumerate(lines):
+            col = k % 2
+            joint_idx = k // 2
+            raw_line.set_data(x_axis_data[:idx], results[:idx, col, joint_idx])
+            smooth_line.set_data(x_axis_data[:idx], smoothed_data[:idx, col, joint_idx])
+
+        filename = str(idx).zfill(5) + ".jpg"
+        plt.savefig(str(output_folder / filename), dpi=100)
+
+    plt.close(fig)
+    print("All frames generated.")
+
+
+def make_result_video(cfg: InferConfig, paths: Dict[str, Path]) -> None:
+    """把 pred1 与 chart 拼接为结果视频。"""
+
+    pred1_dir = str(paths["pred1"]) + os.sep
+    chart_dir = str(paths["chart"]) + os.sep
+    videopath = str(paths["result_dir"] / f"{cfg.videoname}.mp4")
+    getvid(pred1_dir, chart_dir, videopath)
+
+
+def main(cfg: InferConfig) -> None:
+    start_time = time.time()
+
+    paths = build_paths(cfg)
+    ensure_dirs(paths)
+
+    coords, results, frame_files = run_inference_on_frames(cfg, paths)
+    save_npy_results(cfg, paths, coords, results)
+    print_length_width_summary(results)
+
+    # 步态事件估计（仅打印，不改变输出文件）
+    estimate_gait_events_and_cycle(coords)
+
+    # 曲线图帧生成
+    generate_angle_chart_frames(results, paths["chart"])
+
+    # 拼接结果视频
+    make_result_video(cfg, paths)
+
+    end_time = time.time()
+    print('运行时间：', end_time - start_time)
+
+
+if __name__ == "__main__":
+    # 直接运行时采用默认配置。
+    # 若你需要更可复用的形态，可在此加入 argparse，或读取 yaml 配置文件。
+    main(InferConfig())
 
 # # 膝和踝坐标
 # # 左脚

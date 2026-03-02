@@ -7,6 +7,7 @@
 *.pkl
 *.npz
 
+
 ############################
 # Large outputs / logs (project-specific)
 ############################
@@ -33,6 +34,7 @@ events.out.tfevents.*
 # Text files 
 ############################
 *.txt
+*.log
 !requirements.txt
 
 ############################

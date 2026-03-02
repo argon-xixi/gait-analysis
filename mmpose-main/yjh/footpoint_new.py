@@ -112,7 +112,13 @@ def process_frame_footpoint(processed_mask, ank_left, knee_left, calf_length_lef
                     previous_frame_data['angular_velocity_left']
                 )
             else:
-                toe_left=previous_frame_data['toe_left'] +(ank_left-previous_frame_data['ank_left']) 
+                # 历史 toe 点平移：使用本帧踝点相对上一帧踝点的位移近似 toe 位移。
+                # 注意：toe_left 是 tuple，直接与 numpy array 相加会类型报错，这里统一转 np.array。
+                toe_left = tuple(
+                    (np.array(previous_frame_data['toe_left'])
+                     + (np.array(ank_left) - np.array(previous_frame_data['ank_left']))
+                     ).astype(int)
+                )
         else: # 退化情况：如果缺少历史数据，则仍使用PCA
             toe_left = findfootpoint(processed_mask, ank_left, knee_left, 1.2 * calf_length_left)
             vec_ank_knee_curr = np.array(ank_left) - np.array(knee_left)
@@ -132,7 +138,11 @@ def process_frame_footpoint(processed_mask, ank_left, knee_left, calf_length_lef
                     previous_frame_data['angular_velocity_right']
                 )
             else:
-                toe_right=previous_frame_data['toe_right']  +(ank_right-previous_frame_data['ank_right'])
+                toe_right = tuple(
+                    (np.array(previous_frame_data['toe_right'])
+                     + (np.array(ank_right) - np.array(previous_frame_data['ank_right']))
+                     ).astype(int)
+                )
                 vec_ank_knee_curr = np.array(ank_right) - np.array(knee_right)
                 vec_toe_knee_curr = np.array(toe_right) - np.array(knee_right)
                 current_relative_angle = calculate_angle_between_vectors(vec_ank_knee_curr, vec_toe_knee_curr)
