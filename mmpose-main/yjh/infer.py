@@ -160,6 +160,7 @@ detect=mmpose(args_input={'det_config': '/home/yjh/code_yjh/mmpose-main/demo/mmd
 # angle_data = AngleData()
 # chart = AngleChart()
 cnt=0
+
 path_list=sorted(os.listdir(picpath), key=sort_by_number)
 # 存储上一帧以及最后一次非重叠帧的状态信息
 # We store state information from the previous frame and the last non-overlapping frame.
