@@ -8,7 +8,7 @@ mmpose部分参考[mmpose安装文档](https://mmpose.readthedocs.io/zh_CN/lates
 
 sam部分参考[sam安装文档](segment-anything-main/README.md)
 
-
+其余包可以参考[conda包版本推荐](environment.txt)
 
 ## 2. 推流流程
 主要目录是[步态推理根目录](mmpose-main/yjh/infer.py)
