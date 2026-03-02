@@ -4,6 +4,8 @@
 
 - `infer.py`：主推理脚本（从图片序列推理 → 关键点/分割 → 后处理 → 步态参数 → 曲线可视化 → 输出视频/np数据）
 ## 1.环境安装
+我用的python版本是Python 3.8.20
+
 mmpose部分参考[mmpose安装文档](https://mmpose.readthedocs.io/zh_CN/latest/installation.html)
 
 sam部分参考[sam安装文档](segment-anything-main/README.md)
